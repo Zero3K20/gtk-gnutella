@@ -1,0 +1,70 @@
+From: gtk-gnutella project <https://github.com/Zero3K20/gtk-gnutella>
+Date: 2026-03-25
+Subject: [PATCH] [NTOSKRNL/MM] Fall back to top-down VAD search when bottom-up fails
+
+When NtAllocateVirtualMemory is called with a NULL base address and
+MEM_RESERVE (or MEM_RESERVE|MEM_COMMIT), MiInsertVadEx performs a
+bottom-up scan of the process VAD tree via MiFindEmptyAddressRangeInTree.
+If the bottom portion of the address space is heavily fragmented—for
+example because many PE sections from GTK+/GLib and their dependencies
+were mapped at non-pre-rebased addresses—this scan can find no suitable
+contiguous gap and immediately returns STATUS_NO_MEMORY.
+
+The cascade that follows is:
+  1. NtAllocateVirtualMemory returns STATUS_NO_MEMORY.
+  2. The VirtualAlloc caller receives NULL.
+  3. Subsequent VirtualFree(NULL, ...) or VirtualFree of the NULL-
+     derived pointer logs "Unable to find VAD for address 0x00000000".
+  4. Stack-overflow guard-page extension also calls ZwAllocateVirtualMemory
+     and fails → "Close to our death..." → MDL probe crash.
+
+The fix: when the bottom-up scan fails (Result == TableFoundNode) and
+the process is not already in top-down mode, automatically retry with
+MiFindEmptyAddressRangeDownTree.  Top-down search starts from the
+highest valid user address, which is typically far away from the DLL/heap
+cluster at the bottom of the address space.  This mirrors the fallback
+strategy that Windows NT applies internally for processes whose
+bottom-of-space region is saturated.
+
+The fallback only activates when the initial scan has already failed, so
+it introduces no regression for normal allocations.
+
+Affected file: ntoskrnl/mm/ARM3/vadnode.c
+
+diff --git a/ntoskrnl/mm/ARM3/vadnode.c b/ntoskrnl/mm/ARM3/vadnode.c
+--- a/ntoskrnl/mm/ARM3/vadnode.c
++++ b/ntoskrnl/mm/ARM3/vadnode.c
+@@ -290,16 +290,30 @@ MiInsertVadEx(
+         }
+         else
+         {
+-            /* Find an address bottom-up */
++            /* Find an address bottom-up first */
+             Result = MiFindEmptyAddressRangeInTree(ViewSize,
+                                                    Alignment,
+                                                    &CurrentProcess->VadRoot,
+                                                    &Parent,
+                                                    &StartingAddress);
++
++            /*
++             * If the bottom-up scan found no gap (e.g. because many DLLs
++             * were mapped at non-pre-rebased addresses and fragmented the
++             * lower address space), fall back to a top-down scan.  The top
++             * of the user address range is almost always clear of the heap /
++             * DLL cluster and can accommodate large reservations that would
++             * otherwise fail with STATUS_NO_MEMORY.  This matches the
++             * effective behaviour of Windows NT in heavily-fragmented
++             * address spaces.
++             */
++            if (Result == TableFoundNode)
++            {
++                Result = MiFindEmptyAddressRangeDownTree(ViewSize,
++                                                         HighestAddress,
++                                                         Alignment,
++                                                         &CurrentProcess->VadRoot,
++                                                         &StartingAddress,
++                                                         &Parent);
++            }
+         }
+ 
+         /* Get the ending address, which is the last piece we need for the VAD */
