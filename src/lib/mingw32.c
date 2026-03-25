@@ -207,8 +207,8 @@
 #undef _exit		/* _exit() is the real one here */
 
 #define VMM_MINSIZE		(1024*1024*100)	/* At least 100 MiB */
+#define VMM_MAXSIZE		(1024*1024*512)	/* Cap at 512 MiB to avoid VAD table exhaustion */
 #define VMM_GRANULARITY	(1024*1024*4)	/* 4 MiB during initalization */
-#define VMM_COMMIT_CHUNK	(1024*1024*16)	/* 16 MiB batch commit to reduce VAD nodes */
 #define WS2_LIBRARY		"ws2_32.dll"
 
 #define TM_MILLION		1000000L
@@ -4734,7 +4734,6 @@ static struct {
 	void *base;				/* Next available base for reserved memory */
 	const void *heap_break;	/* Initial heap break */
 	size_t consumed;		/* Consumed space in reserved memory */
-	size_t committed;		/* Committed bytes from start of reserved block */
 	size_t size;			/* Size for hinted allocation */
 	size_t later;			/* Size of "later" memory we did not reserve */
 	size_t physical;		/* Physical RAM available */
@@ -4820,6 +4819,19 @@ mingw_vmm_init(void)
 
 	mem_size = mingw_vmm.size;		/* For the VMM space, theoretical max */
 	mem_latersize = mem_size;		/* For non-hinted allocation */
+
+	/*
+	 * Cap the total VMM reservation to VMM_MAXSIZE to avoid exhausting
+	 * the kernel's VAD (Virtual Address Descriptor) table on ReactOS.
+	 * On a 32-bit process the theoretical virtual address space is ~2 GiB,
+	 * but attempting to reserve >1 GiB in a single VirtualAlloc call causes
+	 * MiInsertVadEx to fail with "Not enough free space to insert this VAD
+	 * node!" on ReactOS.  Capping at 512 MiB keeps individual reservations
+	 * well within ReactOS's VAD table capacity.
+	 *		--RAM, 2024
+	 */
+	if (mem_size > VMM_MAXSIZE)
+		mem_size = mem_latersize = VMM_MAXSIZE;
 
 reserve_less:
 	mem_latersize *= 0.9;
@@ -4932,43 +4944,7 @@ mingw_valloc(void *hint, size_t size)
 			p = mingw_vmm.base;
 			mingw_vmm.base = ptr_add_offset(mingw_vmm.base, size);
 			mingw_vmm.consumed += size;
-
-			/*
-			 * Commit the reserved block in large chunks to minimize the
-			 * number of VAD (Virtual Address Descriptor) nodes created in
-			 * the kernel.  On ReactOS each VirtualAlloc(MEM_COMMIT) call
-			 * within a reserved region creates a new VAD node, so doing
-			 * per-allocation commits quickly exhausts the VAD table.
-			 * Batching commits into VMM_COMMIT_CHUNK-sized regions reduces
-			 * VAD pressure from thousands of nodes to a handful.
-			 *		--RAM, 2024
-			 */
-
-			if G_UNLIKELY(mingw_vmm.consumed > mingw_vmm.committed) {
-				size_t chunk = mingw_vmm.consumed - mingw_vmm.committed;
-				size_t avail = mingw_vmm.size - mingw_vmm.committed;
-				void *cb;
-
-				chunk = MAX(chunk, (size_t) VMM_COMMIT_CHUNK);
-				chunk = MIN(chunk, avail);
-				cb = ptr_add_offset(mingw_vmm.reserved, mingw_vmm.committed);
-
-				if G_UNLIKELY(!VirtualAlloc(cb, chunk, MEM_COMMIT,
-						PAGE_READWRITE)) {
-					errno = mingw_last_error();
-					mingw_vmm.base = p;
-					mingw_vmm.consumed -= size;
-					spinunlock(&valloc_slk);
-					s_minilog(G_LOG_LEVEL_CRITICAL,
-						"%s(): failed to batch-commit %'zu bytes at %p: %m",
-						G_STRFUNC, chunk, cb);
-					goto failed;
-				}
-				mingw_vmm.committed += chunk;
-			}
 			spinunlock(&valloc_slk);
-			/* Pages already committed by the batch above; skip VirtualAlloc */
-			goto allocated;
 		} else {
 			/*
 			 * Non-hinted request after hinted requests have been used.
@@ -5021,20 +4997,6 @@ mingw_valloc(void *hint, size_t size)
 			atomic_mb();
 		}
 		p = hint;
-
-		/*
-		 * If the hint falls within our already-committed reserved block
-		 * then the pages are already accessible; calling VirtualAlloc again
-		 * would create a new VAD node on ReactOS for no benefit.
-		 *		--RAM, 2024
-		 */
-		if (
-			ptr_cmp(p, mingw_vmm.reserved) >= 0 &&
-			ptr_cmp(ptr_add_offset(p, size),
-				ptr_add_offset(mingw_vmm.reserved, mingw_vmm.committed)) <= 0
-		) {
-			goto allocated;
-		}
 	}
 
 	p = VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE);
@@ -5123,15 +5085,9 @@ mingw_vfree_fragment(void *addr, size_t size)
 
 	if (ptr_cmp(mingw_vmm.reserved, addr) <= 0 && ptr_cmp(end, addr) > 0) {
 		/*
-		 * Memory is in the reserved block, which is committed in large
-		 * VMM_COMMIT_CHUNK-sized batches.  Skipping the decommit here keeps
-		 * the committed range contiguous, so subsequent re-allocations of
-		 * these pages via a VMM hint can be satisfied without another
-		 * VirtualAlloc call.  This avoids the VAD node proliferation that
-		 * causes ReactOS to report "Not enough free space to insert this
-		 * VAD node!" and crash.  The VMM page cache handles reuse of the
-		 * logically-freed pages entirely in userspace.
-		 *		--RAM, 2024
+		 * Memory is in the reserved block.  The VMM page cache handles
+		 * reuse of logically-freed pages entirely in userspace, so we
+		 * simply skip the decommit to avoid creating extra VAD nodes.
 		 */
 	} else {
 		/*
