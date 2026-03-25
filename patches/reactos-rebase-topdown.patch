@@ -1,0 +1,72 @@
+From: gtk-gnutella project <https://github.com/Zero3K20/gtk-gnutella>
+Date: 2026-03-25
+Subject: [PATCH] [NTOSKRNL/MM] Map rebased images top-down to avoid low address-space fragmentation
+
+ROOT CAUSE
+----------
+When a PE image (DLL) is mapped via NtMapViewOfSection and its preferred
+load address is already occupied, MmMapViewOfSection calls MmFindGap with
+TopDown=FALSE.  That performs a strict bottom-up address-space scan and
+places the rebased DLL at the lowest available gap.
+
+Because ReactOS does not pre-assign unique preferred base addresses to all
+system DLLs at build time (the way Windows NT's linker/rebaser toolchain
+does), virtually every DLL in a GTK+/GLib application is rebased at load
+time.  Dozens of DLLs are therefore scattered across the low portion of
+the user address space, leaving only small, fragmented gaps there.
+
+The cascade of failures this triggers:
+  1. A subsequent VirtualAlloc(NULL, large_size, MEM_RESERVE, ...) call
+     cannot find a large contiguous gap in the bottom of the address space.
+  2. MiInsertVadEx → MiFindEmptyAddressRangeInTree returns STATUS_NO_MEMORY.
+  3. The caller receives a NULL pointer.
+  4. VirtualFree(NULL) logs "Unable to find VAD for address 0x00000000".
+  5. Stack guard-page extension also fails → "Close to our death..." →
+     MDL probe crash.
+
+THE FIX
+-------
+Change the MmFindGap call in the fallback path of MmMapViewOfSection from
+bottom-up (FALSE) to top-down (TRUE).  When a DLL must be placed at a
+different address than its preferred base, it is now allocated from the
+high end of the user address space.  The top of the address space is
+almost always completely empty (no heap, no stack, no explicitly placed
+allocations), so the rebased DLLs pack neatly there and leave the lower
+address space intact for VirtualAlloc, heap, and stack allocations.
+
+This matches the effective behaviour of Windows NT: system DLLs on NT
+have non-conflicting preferred addresses so they never need to be rebased,
+but when an application DLL is rebased (e.g., because of a conflict) NT's
+loader places it in the high part of the address space.
+
+The change is a single-character (FALSE → TRUE) edit in the MmMapViewOfSection
+fallback branch.  It only fires when the preferred address is already in use
+(NotAtBase == TRUE path), so DLLs that load cleanly at their preferred
+address are completely unaffected.
+
+Affected file: ntoskrnl/mm/section.c
+
+diff --git a/ntoskrnl/mm/section.c b/ntoskrnl/mm/section.c
+--- a/ntoskrnl/mm/section.c
++++ b/ntoskrnl/mm/section.c
+@@ -4130,11 +4130,14 @@ MmMapViewOfSection(IN PVOID SectionObject,
+         if (!MmIsAddressRangeFree(AddressSpace, (PVOID)ImageBase, PAGE_ROUND_UP(ImageSize)))
+         {
+             /* Fail if the user requested a fixed base address. */
+             if ((*BaseAddress) != NULL)
+             {
+                 Status = STATUS_CONFLICTING_ADDRESSES;
+                 goto Exit;
+             }
+-            /* Otherwise find a gap to map the image. */
+-            ImageBase = (ULONG_PTR)MmFindGap(AddressSpace, PAGE_ROUND_UP(ImageSize), MM_VIRTMEM_GRANULARITY, FALSE);
++            /*
++             * Otherwise find a gap to map the image.  Search top-down so
++             * that rebased DLLs are placed in the high portion of the user
++             * address space and do not fragment the low address space where
++             * VirtualAlloc(NULL, ...) and heap/stack allocations live.
++             */
++            ImageBase = (ULONG_PTR)MmFindGap(AddressSpace, PAGE_ROUND_UP(ImageSize), MM_VIRTMEM_GRANULARITY, TRUE);
+             if (ImageBase == 0)
+             {
+                 Status = STATUS_CONFLICTING_ADDRESSES;
