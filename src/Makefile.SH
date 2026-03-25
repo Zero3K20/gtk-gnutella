@@ -54,6 +54,7 @@ MANSRC = $installmansrc
 MKDEP = $mkdep \$(DPFLAGS) \$(JCPPFLAGS) --
 MV = $mv
 NM = $nm
+CV2PDB = cv2pdb
 RM = $rm -f
 SED = $sed
 

@@ -207,6 +207,7 @@
 #undef _exit		/* _exit() is the real one here */
 
 #define VMM_MINSIZE		(1024*1024*100)	/* At least 100 MiB */
+#define VMM_MAXSIZE		(1024*1024*512)	/* Cap at 512 MiB to avoid VAD table exhaustion */
 #define VMM_GRANULARITY	(1024*1024*4)	/* 4 MiB during initalization */
 #define WS2_LIBRARY		"ws2_32.dll"
 
@@ -4819,6 +4820,19 @@ mingw_vmm_init(void)
 	mem_size = mingw_vmm.size;		/* For the VMM space, theoretical max */
 	mem_latersize = mem_size;		/* For non-hinted allocation */
 
+	/*
+	 * Cap the total VMM reservation to VMM_MAXSIZE to avoid exhausting
+	 * the kernel's VAD (Virtual Address Descriptor) table on ReactOS.
+	 * On a 32-bit process the theoretical virtual address space is ~2 GiB,
+	 * but attempting to reserve >1 GiB in a single VirtualAlloc call causes
+	 * MiInsertVadEx to fail with "Not enough free space to insert this VAD
+	 * node!" on ReactOS.  Capping at 512 MiB keeps individual reservations
+	 * well within ReactOS's VAD table capacity.
+	 *		--RAM, 2024
+	 */
+	if (mem_size > VMM_MAXSIZE)
+		mem_size = mem_latersize = VMM_MAXSIZE;
+
 reserve_less:
 	mem_latersize *= 0.9;
 	mem_latersize = MAX(mem_latersize, VMM_MINSIZE);
@@ -5070,11 +5084,11 @@ mingw_vfree_fragment(void *addr, size_t size)
 	mingw_vmm.allocated -= size;
 
 	if (ptr_cmp(mingw_vmm.reserved, addr) <= 0 && ptr_cmp(end, addr) > 0) {
-		/* Allocated in reserved space */
-		if (!VirtualFree(addr, size, MEM_DECOMMIT)) {
-			errno = mingw_last_error();
-			return -1;
-		}
+		/*
+		 * Memory is in the reserved block.  The VMM page cache handles
+		 * reuse of logically-freed pages entirely in userspace, so we
+		 * simply skip the decommit to avoid creating extra VAD nodes.
+		 */
 	} else {
 		/*
 		 * Now  that we have emergency allocations, we can no longer use
